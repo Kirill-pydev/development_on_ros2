@@ -1,0 +1,17 @@
+# ROS 2 / colcon (если сборка рядом с репозиторием)
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.so
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
