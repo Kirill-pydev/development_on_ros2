@@ -18,6 +18,9 @@
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>std_srvs</exec_depend>
 
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>action_msgs</exec_depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

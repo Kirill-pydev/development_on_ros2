@@ -13,11 +13,11 @@
 
 | Роль на хакатоне | Зона ответственности в учебнике | Каталог в `hackathon_robot/` | Что лежит сейчас |
 |------------------|----------------------------------|------------------------------|------------------|
-| **Архитектор FSM** | `robot_node.py`: диспетчер, переходы состояний | `hackathon_robot/fsm_architect/` | Пока пустой подпакет — сюда по пайплайну учебника переносится центральная нода FSM |
-| **CV-инженер** | детекция (в учебнике — `person_detector_node`, HOG), топики `/person_detected`, offset | `hackathon_robot/cv_engineer/` | `yolo_finetune_node.py` (сбор данных под дообучение; отдельно можно добавить HOG/YOLO-инференс по тем же топикам) |
+| **Архитектор FSM** | `robot_node.py`: диспетчер, переходы состояний | `hackathon_robot/fsm_architect/` | `robot_fsm_node.py` — приоритеты батарея / приветствие / исследование, Nav2, `robot/command` |
+| **CV-инженер** | детекция (в учебнике — `person_detector_node`, HOG), топики `/person_detected`, offset | `hackathon_robot/cv_engineer/` | `person_detector_node.py` (HOG), `yolo_finetune_node.py` |
 | **Nav-инженер** | exploration, цели Nav2, обработка результата | `hackathon_robot/nav_engineer/` | `autonomous_drive_forward.py`, `contour_avoidance.py` — низкоуровневый объезд по `/scan` + `/cmd_vel` (параллель учебниковому Nav2; один стек выбирает команда) |
 | **Платформа / сенсоры** *(дополнение к карте ролей)* | в учебнике косвенно (карта, лидара) | `hackathon_robot/sensing/` | `lidar_calibrator.py` — калибровка лидара и публикация TF |
-| **Интегратор** | `launch/`, `config/params.yaml`, совместные прогоны, демо | Корень пакета: `config/`, при добавлении — `launch/` | Сейчас: `config/yolo_data.example.yaml`; общие launch-файлы — зона интегратора |
+| **Интегратор** | `launch/`, `config/params.yaml`, совместные прогоны, демо | `launch/`, `config/` | `voice_stack.launch.py`, `bringup_voice_fsm.launch.py`, `config/yolo_data.example.yaml` |
 
 Имена исполняемых ROS-команд (`ros2 run hackathon_robot …`) **не менялись** — меняется только путь к модулю внутри пакета.
 
@@ -27,15 +27,26 @@
 
 ### Зависимости ROS 2
 
-Пакет `hackathon_robot` (`ament_python`) ожидает стандартные сообщения и `tf2_ros`, а также **`cv_bridge`** (для ноды YOLO).
+Пакет `hackathon_robot` (`ament_python`) ожидает стандартные сообщения, **`nav2_msgs`**, **`tf2_ros`**, **`cv_bridge`**. Для FSM с навигацией на роботе должен быть запущен Nav2 (action `navigate_to_pose`).
 
 ### Зависимости Python (частично через `setup.py`)
 
-В пакете указано `PyYAML` (файлы калибровки лидара). Для ноды YOLO дополнительно нужен OpenCV:
+В `setup.py`: `PyYAML`, **`numpy`**. Дополнительно:
 
 ```bash
 pip install opencv-python-headless
+pip install vosk sounddevice
 ```
+
+Опционально после локальной установки пакета:
+
+```bash
+pip install ".[voice]"
+```
+
+**Синтез офлайн:** [espeak-ng](https://github.com/espeak-ng/espeak-ng) (Linux: `sudo apt install espeak-ng`).
+
+**Модель Vosk:** [alphacephei.com/vosk/models](https://alphacephei.com/vosk/models) — распакуйте и передайте путь в `vosk_model_path` при запуске launch.
 
 Обучение YOLO офлайн (вне ROS или в отдельном терминале):
 
@@ -71,8 +82,32 @@ source install/setup.bash
 | `ros2 run hackathon_robot autonomous_drive_forward` | `nav_engineer/autonomous_drive_forward.py` | Движение вперёд с объездом препятствий (конечный автомат) |
 | `ros2 run hackathon_robot contour_avoidance` | `nav_engineer/contour_avoidance.py` | Альтернативный сценарий объезда контура с одометрией |
 | `ros2 run hackathon_robot yolo_finetune_node` | `cv_engineer/yolo_finetune_node.py` | Сбор кадров с камеры для датасета и дообучения YOLO |
+| `ros2 run hackathon_robot person_detector` | `cv_engineer/person_detector_node.py` | HOG: `/person_detected`, `/person_offset_x` |
+| `ros2 run hackathon_robot robot_fsm` | `fsm_architect/robot_fsm_node.py` | FSM + Nav2 + голосовые команды (`robot/command`) |
+| `ros2 run hackathon_robot tts_espeak` | `voice/tts_espeak_node.py` | Очередь фраз → espeak-ng, статус `voice/tts_state` |
+| `ros2 run hackathon_robot asr_vosk` | `voice/asr_vosk_node.py` | Vosk → `voice/recognized_text` |
+| `ros2 run hackathon_robot voice_command_processor` | `voice/command_processor_node.py` | Парсер → `robot/command` + ответ в TTS |
 
-**Важно:** обе ноды объезда объявляют имя ноды `autonomous_drive` внутри кода. Одновременно их не запускайте; для одной машины выберите одну стратегию объезда.
+**Launch:**
+
+```bash
+ros2 launch hackathon_robot voice_stack.launch.py vosk_model_path:=/ABS/PATH/vosk-model-small-ru-0.22
+ros2 launch hackathon_robot bringup_voice_fsm.launch.py vosk_model_path:=/ABS/PATH/vosk-model-small-ru-0.22 camera_topic:=/camera_node/image_raw
+```
+
+**Важно:** не совмещайте **`robot_fsm`** (Nav2 и `/cmd_vel`) с **`autonomous_drive_forward`** / **`contour_avoidance`**, если все публикуют в один `/cmd_vel`. Обе ноды объезда по-прежнему объявляют имя `autonomous_drive` — их не запускайте одновременно друг с другом.
+
+---
+
+## Голос (офлайн), поток как в учебнике
+
+Цепочка: **микрофон → Vosk (`voice/recognized_text`) → парсер (`robot/command`) → исполнение в `robot_fsm` + синтез ответа (`voice/text_to_speak` → espeak-ng)**. Топики совместимы с описанием в файле «Распознавание и синтез речи», но ASR/TTS без SpeechKit.
+
+Имитация команды:
+
+```bash
+ros2 topic pub --once /voice_cmd std_msgs/msg/String "data: 'робот найди синий куб'"
+```
 
 ---
 
@@ -186,12 +221,22 @@ hackathon_robot/
   resource/hackathon_robot
   config/                         ← зона интегратора (пример data.yaml)
     yolo_data.example.yaml
+  launch/
+    voice_stack.launch.py
+    bringup_voice_fsm.launch.py
   hackathon_robot/
     __init__.py
-    fsm_architect/                ← архитектор FSM (robot_node из учебника)
+    voice/
+      command_parser.py
+      asr_vosk_node.py
+      tts_espeak_node.py
+      command_processor_node.py
+    fsm_architect/
       __init__.py
-    cv_engineer/                  ← CV-инженер
+      robot_fsm_node.py
+    cv_engineer/
       __init__.py
+      person_detector_node.py
       yolo_finetune_node.py
     nav_engineer/                 ← Nav-инженер (+ лидара-объезд как альтернатива Nav2)
       __init__.py
