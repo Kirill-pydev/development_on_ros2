@@ -173,7 +173,13 @@ ros2_ws/src/hackathon_robot/   ← содержимое каталога hackath
 
 Зависимости ROS (через дистрибутив): **`rclpy`**, сообщения геометрии/навигации, **`nav2_msgs`**, **`tf2_ros`**, **`cv_bridge`**, **`std_srvs`**, **`action_msgs`**.
 
-Python (минимум):
+Python (из корня этого репозитория удобно ставить всё разом):
+
+```bash
+pip install -r requirements.txt
+```
+
+Либо точечно:
 
 ```bash
 pip install opencv-python-headless vosk sounddevice ultralytics
@@ -240,6 +246,7 @@ ros2 launch hackathon_robot bringup_voice_fsm.launch.py vosk_model_path:=/ABS/PA
 ```text
 development_on_ros2/
   README.md                 ← вы здесь
+  requirements.txt          зависимости pip для хакатона
   .gitignore
   *.txt                     архивные копии скриптов (до пакета)
   hackathon_robot/          ROS 2 пакет ament_python
