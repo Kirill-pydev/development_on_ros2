@@ -1,0 +1,14 @@
+# Пример data.yaml для Ultralytics YOLO v8 (detect).
+# Скопируйте рядом с вашим датасетом и замените path на абсолютный путь к корню датасета.
+
+path: /ABSOLUTE/PATH/TO/yolo_dataset
+train: images/train
+val: images/val
+
+nc: 2
+names:
+  0: cone
+  1: my_new_class
+
+# Разметка YOLO: для каждого изображения labels/train/<имя>.txt со строками:
+# class_id x_center y_center width height   (все координаты нормализованы 0..1)
