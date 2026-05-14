@@ -1,385 +1,400 @@
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry
-from std_msgs.msg import Float32, String
 import math
-import time
 import os
-import yaml
+import time
 from enum import Enum
 
+import rclpy
+import yaml
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Float32, String
+
+
 class RobotState(Enum):
-    """Состояния робота"""
-    MOVING_FORWARD = 1      # Движение прямо
-    AVOIDING_OBSTACLE = 2   # Объезд препятствия
-    RETURNING_TO_PATH = 3   # Возврат на траекторию
-    STOPPED = 4             # Аварийная остановка
+    MOVING_FORWARD = 1
+    FOLLOW_GAP = 2
+    RECOVER_HEADING = 3
+    BACK_UP = 4
+    STOPPED = 5
+
+
+def _yaw_from_orientation(ox: float, oy: float, oz: float, ow: float) -> float:
+    siny_cosp = 2.0 * (ow * oz + ox * oy)
+    cosy_cosp = 1.0 - 2.0 * (oy * oy + oz * oz)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def _angle_diff(a: float, b: float) -> float:
+    d = a - b
+    while d > math.pi:
+        d -= 2.0 * math.pi
+    while d < -math.pi:
+        d += 2.0 * math.pi
+    return d
+
 
 class AutonomousDrive(Node):
     def __init__(self):
         super().__init__('autonomous_drive')
-        
-        # Параметры движения
-        self.declare_parameter('linear_speed', 0.2)          # Скорость вперёд (м/с)
-        self.declare_parameter('rotation_speed', 0.5)        # Скорость поворота (рад/с)
-        self.declare_parameter('obstacle_distance', 0.4)     # Дистанция начала объезда (м)
-        self.declare_parameter('safe_distance', 0.6)         # Безопасная дистанция (м)
-        self.declare_parameter('field_of_view', 60.0)        # Угол обзора (градусы)
-        self.declare_parameter('use_odometry', False)        # Использовать одометрию
-        
-        self.linear_speed = self.get_parameter('linear_speed').value
-        self.rotation_speed = self.get_parameter('rotation_speed').value
-        self.obstacle_distance = self.get_parameter('obstacle_distance').value
-        self.safe_distance = self.get_parameter('safe_distance').value
-        self.field_of_view = self.get_parameter('field_of_view').value
-        self.use_odometry = self.get_parameter('use_odometry').value
-        
-        # Переменные состояния
+
+        self.declare_parameter('linear_speed', 0.2)
+        self.declare_parameter('rotation_speed', 0.65)
+        self.declare_parameter('obstacle_distance', 0.38)
+        self.declare_parameter('emergency_distance', 0.14)
+        self.declare_parameter('safe_distance', 0.55)
+        self.declare_parameter('field_of_view', 70.0)
+        self.declare_parameter('gap_search_step_deg', 6.0)
+        self.declare_parameter('gap_cone_half_deg', 10.0)
+        self.declare_parameter('recover_yaw_gain', 1.35)
+        self.declare_parameter('recover_yaw_tol_deg', 12.0)
+        self.declare_parameter('recover_min_clear_front', 0.42)
+        self.declare_parameter('clear_frames_to_recover', 3)
+        self.declare_parameter('stuck_timeout_s', 4.0)
+        self.declare_parameter('stuck_move_eps', 0.02)
+        self.declare_parameter('backup_duration_s', 0.75)
+        self.declare_parameter('backup_speed', -0.12)
+
+        self.linear_speed = float(self.get_parameter('linear_speed').value)
+        self.rotation_speed = float(self.get_parameter('rotation_speed').value)
+        self.obstacle_distance = float(self.get_parameter('obstacle_distance').value)
+        self.emergency_distance = float(self.get_parameter('emergency_distance').value)
+        self.safe_distance = float(self.get_parameter('safe_distance').value)
+        self.field_of_view = float(self.get_parameter('field_of_view').value)
+        self.gap_step = float(self.get_parameter('gap_search_step_deg').value)
+        self.gap_cone = float(self.get_parameter('gap_cone_half_deg').value)
+        self.recover_k = float(self.get_parameter('recover_yaw_gain').value)
+        self.recover_tol = math.radians(float(self.get_parameter('recover_yaw_tol_deg').value))
+        self.recover_min_front = float(self.get_parameter('recover_min_clear_front').value)
+        self.clear_frames = int(self.get_parameter('clear_frames_to_recover').value)
+        self.stuck_timeout = float(self.get_parameter('stuck_timeout_s').value)
+        self.stuck_eps = float(self.get_parameter('stuck_move_eps').value)
+        self.backup_duration = float(self.get_parameter('backup_duration_s').value)
+        self.backup_speed = float(self.get_parameter('backup_speed').value)
+
         self.state = RobotState.MOVING_FORWARD
-        self.obstacle_direction = 0
-        self.avoidance_start_time = 0.0
-        self.return_start_time = 0.0
+        self._target_course_yaw: float | None = None
+        self._clear_counter = 0
+        self._backup_until = 0.0
+        self._stuck_ref_xy = (0.0, 0.0)
+        self._stuck_sample_t = time.monotonic()
+        self._stuck_initialized = False
+        self._last_odom_t = time.monotonic()
+
         self.total_distance = 0.0
         self.start_position = None
-        self.current_position = None
         self.last_position = None
         self.movement_start_time = time.time()
-        
-        # Данные с сенсоров
+
         self.latest_scan = None
         self.scan_received = False
+        self.current_yaw = 0.0
         self.odom_received = False
-        
-        # 🔧 ПЕРЕМЕННЫЕ КАЛИБРОВКИ
+
         self.lidar_offset_angle_deg = 0.0
         self.lidar_offset_angle_rad = 0.0
         self.is_calibrated = False
-        
-        # Издатели
+
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.state_pub = self.create_publisher(String, '/robot_state', 10)
         self.distance_pub = self.create_publisher(Float32, '/distance_traveled', 10)
-        
-        # Подписки
-        self.scan_sub = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self.scan_callback,
-            10
-        )
-        
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            '/odom',
-            self.odom_callback,
-            10
-        )
-        
-        # Таймеры
-        self.control_timer = self.create_timer(0.1, self.control_loop)      # 10 Гц
-        self.progress_timer = self.create_timer(2.0, self.check_progress)   # 0.5 Гц
-        
-        # 🔧 ЗАГРУЖАЕМ КАЛИБРОВКУ
+
+        self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+
+        self.create_timer(0.1, self.control_loop)
+        self.create_timer(2.0, self.check_progress)
+
         self.load_lidar_calibration()
-        
+
         self.get_logger().info('=' * 60)
-        self.get_logger().info('🤖 ROBOT AUTONOMOUS DRIVE NODE STARTED 🤖')
-        self.get_logger().info('Режим: БЕСКОНЕЧНОЕ ДВИЖЕНИЕ ВПЕРЁД')
-        self.get_logger().info(f'Скорость: {self.linear_speed} м/с')
-        self.get_logger().info(f'Дистанция обнаружения препятствий: {self.obstacle_distance} м')
-        self.get_logger().info(f'Калибровка лидара: {"✅ ЗАГРУЖЕНА" if self.is_calibrated else "❌ НЕ НАЙДЕНА"}')
-        if self.is_calibrated:
-            self.get_logger().info(f'Смещение лидара: {self.lidar_offset_angle_deg:.1f}°')
-        else:
-            self.get_logger().warn('⏳ Робот не будет двигаться без калибровки!')
-            self.get_logger().warn('Запустите ноду калибровки лидара')
+        self.get_logger().info('AUTO DRIVE: вперёд + объезд по «щели» и одометрии курса')
+        self.get_logger().info(f'Скорость: {self.linear_speed} м/с | триггер: {self.obstacle_distance} м')
+        self.get_logger().info(f'Калибровка лидара: {"OK" if self.is_calibrated else "НЕТ"}')
         self.get_logger().info('=' * 60)
-    
-    # ============================================================
-    # 🔧 ЗАГРУЗКА КАЛИБРОВКИ
-    # ============================================================
-    
+
     def load_lidar_calibration(self):
-        """Загружает калибровку из params/lidar_calibration.yaml"""
         calib_path = os.path.join(os.getcwd(), 'params', 'lidar_calibration.yaml')
-        
         try:
             if not os.path.exists(calib_path):
-                self.get_logger().warn(f'⚠️ Файл калибровки не найден: {calib_path}')
+                self.get_logger().warn(f'Нет файла калибровки: {calib_path}')
                 self.is_calibrated = False
                 return
-            
-            with open(calib_path, 'r') as f:
+            with open(calib_path, 'r', encoding='utf-8') as f:
                 calib_data = yaml.safe_load(f)
-            
             self.lidar_offset_angle_deg = float(calib_data.get('lidar_offset_angle_deg', 0.0))
             self.lidar_offset_angle_rad = math.radians(self.lidar_offset_angle_deg)
-            
             self.is_calibrated = True
-            self.get_logger().info(f'✅ Калибровка загружена: смещение {self.lidar_offset_angle_deg:.2f}°')
-            
-        except Exception as e:
-            self.get_logger().error(f'❌ Ошибка загрузки: {e}')
+            self.get_logger().info(f'Калибровка: смещение {self.lidar_offset_angle_deg:.2f}°')
+        except (OSError, TypeError, ValueError, yaml.YAMLError) as e:
+            self.get_logger().error(f'Ошибка чтения калибровки: {e}')
             self.is_calibrated = False
-    
-    # ============================================================
-    # 🔧 КОРРЕКЦИЯ УГЛА
-    # ============================================================
-    
-    def get_corrected_angle_deg(self, raw_angle_deg):
-        """Применяет калибровочное смещение. Возвращает [-180, 180]"""
+
+    def get_corrected_angle_deg(self, raw_angle_deg: float) -> float:
         if not self.is_calibrated:
             return raw_angle_deg
         corrected = raw_angle_deg - self.lidar_offset_angle_deg
-        while corrected > 180: corrected -= 360
-        while corrected < -180: corrected += 360
+        while corrected > 180:
+            corrected -= 360
+        while corrected < -180:
+            corrected += 360
         return corrected
-    
-    def get_raw_angle_deg_from_index(self, scan, index):
-        """Вычисляет угол луча лидара по индексу"""
+
+    @staticmethod
+    def get_raw_angle_deg_from_index(scan: LaserScan, index: int) -> float:
         angle_rad = scan.angle_min + index * scan.angle_increment
         angle_deg = math.degrees(angle_rad)
-        if angle_deg > 180: angle_deg -= 360
+        if angle_deg > 180:
+            angle_deg -= 360
         return angle_deg
-    
-    # ============================================================
-    # КОЛБЭКИ
-    # ============================================================
-    
+
     def scan_callback(self, msg: LaserScan):
         self.latest_scan = msg
         self.scan_received = True
-    
+
     def odom_callback(self, msg: Odometry):
         self.odom_received = True
+        q = msg.pose.pose.orientation
+        self.current_yaw = _yaw_from_orientation(q.x, q.y, q.z, q.w)
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
-        self.current_position = (x, y)
-        
+        self._last_odom_t = time.monotonic()
         if self.start_position is None:
             self.start_position = (x, y)
             self.last_position = (x, y)
-        
-        # Считаем пройденное расстояние по одометрии
+            self._stuck_ref_xy = (x, y)
+            self._stuck_initialized = True
         if self.last_position is not None:
             dx = x - self.last_position[0]
             dy = y - self.last_position[1]
-            self.total_distance += math.sqrt(dx*dx + dy*dy)
-        
+            self.total_distance += math.hypot(dx, dy)
         self.last_position = (x, y)
-    
-    # ============================================================
-    # ОБНАРУЖЕНИЕ ПРЕПЯТСТВИЙ
-    # ============================================================
-    
-    def check_obstacle_ahead(self):
-        """Проверяет наличие препятствия впереди с учётом калибровки"""
+
+    def front_obstacle_info(self):
         if not self.scan_received or self.latest_scan is None:
-            return False, float('inf'), 0.0
-        
+            return False, float('inf'), 0.0, float('inf')
+
         scan = self.latest_scan
         half_fov = self.field_of_view / 2.0
         min_distance = float('inf')
         min_angle = 0.0
-        
+        mean_count = 0
+        mean_sum = 0.0
+
         for i, distance in enumerate(scan.ranges):
             if distance < scan.range_min or distance > scan.range_max:
                 continue
             raw_angle = self.get_raw_angle_deg_from_index(scan, i)
             corrected_angle = self.get_corrected_angle_deg(raw_angle)
-            
             if abs(corrected_angle) <= half_fov:
+                mean_sum += distance
+                mean_count += 1
                 if distance < min_distance:
                     min_distance = distance
                     min_angle = corrected_angle
-        
-        obstacle = min_distance < self.obstacle_distance
-        return obstacle, min_distance, min_angle
-    
-    def find_best_avoidance_direction(self):
-        """Определяет лучшее направление для объезда"""
+
+        front_mean = mean_sum / mean_count if mean_count else float('inf')
+        critical = min_distance < self.emergency_distance
+        blocked = min_distance < self.obstacle_distance
+        return blocked, min_distance, min_angle, front_mean
+
+    def min_range_in_cone(self, scan: LaserScan, center_deg: float, half_deg: float) -> float:
+        dmin = float('inf')
+        for i, distance in enumerate(scan.ranges):
+            if distance < scan.range_min or distance > scan.range_max:
+                continue
+            raw_angle = self.get_raw_angle_deg_from_index(scan, i)
+            corrected = self.get_corrected_angle_deg(raw_angle)
+            if abs(corrected - center_deg) <= half_deg and distance < dmin:
+                dmin = distance
+        return dmin
+
+    def best_gap_steering_deg(self) -> tuple[float, float]:
         if not self.scan_received or self.latest_scan is None:
-            return 1  # По умолчанию вправо
-        
+            return 0.0, 0.0
+
         scan = self.latest_scan
-        left_clear = self.check_direction_clear(scan, -60, -30)
-        right_clear = self.check_direction_clear(scan, 30, 60)
-        
-        if left_clear and not right_clear:
-            return -1  # Влево
-        elif right_clear and not left_clear:
-            return 1   # Вправо
-        elif left_clear and right_clear:
-            left_dist = self.get_average_distance_in_sector(scan, -60, -30)
-            right_dist = self.get_average_distance_in_sector(scan, 30, 60)
-            return -1 if left_dist > right_dist else 1
-        return -1  # Если всё заблокировано — влево
-    
-    def check_direction_clear(self, scan, start_angle_deg, end_angle_deg):
-        """Проверяет, свободно ли направление в секторе"""
-        return self.get_min_distance_in_sector(scan, start_angle_deg, end_angle_deg) > self.safe_distance
-    
-    def get_min_distance_in_sector(self, scan, start_angle_deg, end_angle_deg):
-        """Минимальное расстояние в секторе (с коррекцией углов)"""
-        min_dist = float('inf')
-        for i, distance in enumerate(scan.ranges):
-            if distance < scan.range_min or distance > scan.range_max:
-                continue
-            raw_angle = self.get_raw_angle_deg_from_index(scan, i)
-            corrected_angle = self.get_corrected_angle_deg(raw_angle)
-            if start_angle_deg <= corrected_angle <= end_angle_deg:
-                if distance < min_dist:
-                    min_dist = distance
-        return min_dist
-    
-    def get_average_distance_in_sector(self, scan, start_angle_deg, end_angle_deg):
-        """Среднее расстояние в секторе (с коррекцией углов)"""
-        distances = []
-        for i, distance in enumerate(scan.ranges):
-            if distance < scan.range_min or distance > scan.range_max:
-                continue
-            raw_angle = self.get_raw_angle_deg_from_index(scan, i)
-            corrected_angle = self.get_corrected_angle_deg(raw_angle)
-            if start_angle_deg <= corrected_angle <= end_angle_deg:
-                distances.append(distance)
-        return sum(distances) / len(distances) if distances else 0.0
-    
-    # ============================================================
-    # УПРАВЛЕНИЕ ДВИЖЕНИЕМ
-    # ============================================================
-    
+        best_score = -1.0
+        best_deg = 0.0
+        deg = -85.0
+        while deg <= 85.0:
+            dist = self.min_range_in_cone(scan, deg, self.gap_cone)
+            if dist >= scan.range_max * 0.99:
+                dist = scan.range_max * 0.99
+            rad = math.radians(deg)
+            score = dist * max(0.15, math.cos(rad)) ** 2
+            if score > best_score:
+                best_score = score
+                best_deg = deg
+            deg += self.gap_step
+        return best_deg, best_score
+
+    def is_path_clear_for_recover(self) -> bool:
+        if not self.scan_received or self.latest_scan is None:
+            return False
+        scan = self.latest_scan
+        d = self.min_range_in_cone(scan, 0.0, self.field_of_view / 2.2)
+        return d > self.recover_min_front
+
+    def check_stuck(self) -> bool:
+        if not self._stuck_initialized or self.last_position is None:
+            return False
+        now = time.monotonic()
+        if now - self._stuck_sample_t < self.stuck_timeout:
+            return False
+        x, y = self.last_position[0], self.last_position[1]
+        moved = math.hypot(x - self._stuck_ref_xy[0], y - self._stuck_ref_xy[1])
+        self._stuck_sample_t = now
+        self._stuck_ref_xy = (x, y)
+        cmd_active = self.state in (
+            RobotState.MOVING_FORWARD,
+            RobotState.FOLLOW_GAP,
+            RobotState.RECOVER_HEADING,
+        )
+        return cmd_active and moved < self.stuck_eps
+
     def control_loop(self):
-        """Основной цикл управления (10 Гц)"""
-        
-        # БЛОКИРОВКА: Нет калибровки
         if not self.is_calibrated:
             self.stop_robot()
             return
-        
-        obstacle, distance, angle = self.check_obstacle_ahead()
-        
-        # Конечный автомат
+
+        blocked, front_min, _, _ = self.front_obstacle_info()
+
+        if front_min < self.emergency_distance and self.state != RobotState.BACK_UP:
+            self.stop_robot()
+            self.state = RobotState.BACK_UP
+            self._backup_until = time.monotonic() + self.backup_duration
+            self.get_logger().warn(f'Критически близко ({front_min:.2f} м) — откат')
+            return
+
+        if self.check_stuck() and self.state not in (RobotState.BACK_UP, RobotState.STOPPED):
+            self.get_logger().warn('Нет прогресса — откат')
+            self.state = RobotState.BACK_UP
+            self._backup_until = time.monotonic() + self.backup_duration
+            if self.last_position is not None:
+                self._stuck_ref_xy = (self.last_position[0], self.last_position[1])
+            self._stuck_sample_t = time.monotonic()
+            return
+
         if self.state == RobotState.MOVING_FORWARD:
-            self.handle_moving_forward(obstacle, distance, angle)
-        elif self.state == RobotState.AVOIDING_OBSTACLE:
-            self.handle_avoiding_obstacle(obstacle, distance, angle)
-        elif self.state == RobotState.RETURNING_TO_PATH:
-            self.handle_returning_to_path()
+            self._do_forward(blocked)
+        elif self.state == RobotState.FOLLOW_GAP:
+            self._do_follow_gap(blocked)
+        elif self.state == RobotState.RECOVER_HEADING:
+            self._do_recover()
+        elif self.state == RobotState.BACK_UP:
+            self._do_backup()
         elif self.state == RobotState.STOPPED:
             self.stop_robot()
-        
-        # Публикация состояния
-        state_msg = String()
-        state_msg.data = self.state.name
-        self.state_pub.publish(state_msg)
-        
-        # Публикация пройденного расстояния
-        dist_msg = Float32()
-        dist_msg.data = self.total_distance
-        self.distance_pub.publish(dist_msg)
-    
-    def handle_moving_forward(self, obstacle, distance, angle):
-        """Движение прямо"""
-        if obstacle:
-            self.state = RobotState.AVOIDING_OBSTACLE
-            self.obstacle_direction = self.find_best_avoidance_direction()
-            self.avoidance_start_time = time.time()
-            direction_text = "ВЛЕВО" if self.obstacle_direction == -1 else "ВПРАВО"
-            self.get_logger().warn(
-                f'⚠️ ПРЕПЯТСТВИЕ на {distance:.2f}м (угол {angle:.1f}°)! '
-                f'Объезжаю {direction_text}'
-            )
-        else:
-            cmd = Twist()
-            cmd.linear.x = self.linear_speed
-            cmd.angular.z = 0.0
-            self.cmd_pub.publish(cmd)
-    
-    def handle_avoiding_obstacle(self, obstacle, distance, angle):
-        """Объезд препятствия"""
+
+        self.state_pub.publish(String(data=self.state.name))
+        self.distance_pub.publish(Float32(data=self.total_distance))
+
+    def _do_forward(self, blocked: bool):
+        if blocked:
+            self._target_course_yaw = self.current_yaw
+            self._clear_counter = 0
+            self.state = RobotState.FOLLOW_GAP
+            self.get_logger().info('Препятствие — режим подруливания к щели')
+            return
         cmd = Twist()
-        cmd.linear.x = self.linear_speed * 0.7  # Снижаем скорость
-        cmd.angular.z = self.obstacle_direction * self.rotation_speed
-        self.cmd_pub.publish(cmd)
-        
-        # Проверяем, можно ли вернуться на курс
-        if not obstacle and (time.time() - self.avoidance_start_time) > 1.0:
-            self.state = RobotState.RETURNING_TO_PATH
-            self.return_start_time = time.time()
-            self.get_logger().info('✅ Препятствие объехано, возвращаюсь на курс')
-    
-    def handle_returning_to_path(self):
-        """Возврат на первоначальную траекторию"""
-        obstacle, _, _ = self.check_obstacle_ahead()
-        
-        if obstacle:
-            # Новое препятствие — опять объезд
-            self.state = RobotState.AVOIDING_OBSTACLE
-            self.obstacle_direction = self.find_best_avoidance_direction()
-            self.avoidance_start_time = time.time()
-            self.get_logger().warn('⚠️ Новое препятствие при возврате на курс!')
-        else:
-            cmd = Twist()
-            cmd.linear.x = self.linear_speed * 0.9
-            cmd.angular.z = -self.obstacle_direction * self.rotation_speed * 0.5
-            self.cmd_pub.publish(cmd)
-            
-            # Через 1.5 секунды возвращаемся к движению прямо
-            if time.time() - self.return_start_time > 1.5:
-                self.state = RobotState.MOVING_FORWARD
-                self.get_logger().info('✅ Вернулся на курс, продолжаю движение')
-    
-    def stop_robot(self):
-        """Останавливает робота"""
-        cmd = Twist()
-        cmd.linear.x = 0.0
+        cmd.linear.x = self.linear_speed
         cmd.angular.z = 0.0
         self.cmd_pub.publish(cmd)
-    
-    def check_progress(self):
-        """Периодический вывод информации о движении"""
-        if not self.is_calibrated:
-            self.get_logger().warn('⏳ Ожидание калибровки лидара...')
+
+    def _do_follow_gap(self, blocked: bool):
+        scan = self.latest_scan
+        best_deg, score = self.best_gap_steering_deg()
+        cmd = Twist()
+
+        if scan is not None and blocked and score < self.emergency_distance * 0.35:
+            cmd.linear.x = 0.0
+            cmd.angular.z = math.copysign(self.rotation_speed, best_deg if best_deg != 0 else 1.0)
+            self.cmd_pub.publish(cmd)
             return
-        
+
+        rad = math.radians(best_deg)
+        cmd.angular.z = max(-self.rotation_speed, min(self.rotation_speed, 2.2 * rad))
+        speed_scale = min(1.0, max(0.25, score / max(self.safe_distance, 0.1)))
+        cmd.linear.x = self.linear_speed * 0.78 * speed_scale
+        self.cmd_pub.publish(cmd)
+
+        if not blocked:
+            self._clear_counter += 1
+        else:
+            self._clear_counter = 0
+
+        if self._clear_counter >= self.clear_frames and self.is_path_clear_for_recover():
+            if self._target_course_yaw is not None:
+                self.state = RobotState.RECOVER_HEADING
+                self.get_logger().info('Фронт свободен — выравнивание по курсу')
+            else:
+                self.state = RobotState.MOVING_FORWARD
+
+    def _do_recover(self):
+        if self._target_course_yaw is None:
+            self.state = RobotState.MOVING_FORWARD
+            return
+        err = _angle_diff(self._target_course_yaw, self.current_yaw)
+        if abs(err) < self.recover_tol:
+            self.state = RobotState.MOVING_FORWARD
+            self._target_course_yaw = None
+            self.get_logger().info('Курс восстановлен')
+            return
+
+        obstacle_ahead, _, _, _ = self.front_obstacle_info()
+        if obstacle_ahead:
+            self.state = RobotState.FOLLOW_GAP
+            self._clear_counter = 0
+            self.get_logger().warn('Снова препятствие при выравнивании')
+            return
+
+        cmd = Twist()
+        cmd.linear.x = self.linear_speed * 0.55
+        cmd.angular.z = max(-self.rotation_speed, min(self.rotation_speed, self.recover_k * err))
+        self.cmd_pub.publish(cmd)
+
+    def _do_backup(self):
+        if time.monotonic() >= self._backup_until:
+            self.state = RobotState.FOLLOW_GAP
+            self._clear_counter = 0
+            self.get_logger().info('Откат завершён — ищу щель')
+            return
+        cmd = Twist()
+        cmd.linear.x = self.backup_speed
+        cmd.angular.z = 0.0
+        self.cmd_pub.publish(cmd)
+
+    def stop_robot(self):
+        self.cmd_pub.publish(Twist())
+
+    def check_progress(self):
+        if not self.is_calibrated:
+            self.get_logger().warn('Жду калибровку лидара...')
+            return
         elapsed = time.time() - self.movement_start_time
         hours = int(elapsed // 3600)
         minutes = int((elapsed % 3600) // 60)
         seconds = int(elapsed % 60)
-        
         self.get_logger().info(
-            f'📊 Время в пути: {hours:02d}:{minutes:02d}:{seconds:02d} | '
-            f'Пройдено: {self.total_distance:.2f} м | '
-            f'Состояние: {self.state.name}'
+            f'Время: {hours:02d}:{minutes:02d}:{seconds:02d} | '
+            f'Путь: {self.total_distance:.2f} м | {self.state.name}'
         )
-        
-        # Аварийная остановка при долгом объезде
-        if self.state == RobotState.AVOIDING_OBSTACLE:
-            avoid_time = time.time() - self.avoidance_start_time
-            if avoid_time > 10.0:
-                self.get_logger().error(
-                    f'❌ Застрял при объезде ({avoid_time:.1f} сек)! Останавливаюсь.'
-                )
-                self.stop_robot()
-                self.state = RobotState.STOPPED
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = AutonomousDrive()
-    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('')
-        node.get_logger().info('🛑 Остановка пользователем (Ctrl+C)')
+        node.get_logger().info('Остановка (Ctrl+C)')
         node.stop_robot()
-    except Exception as e:
-        node.get_logger().error(f'❌ Критическая ошибка: {e}')
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

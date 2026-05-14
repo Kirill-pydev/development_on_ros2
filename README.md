@@ -53,6 +53,7 @@ flowchart TB
 
   subgraph NAVLOW["Низкоуровневая навигация"]
     AF[nav: autonomous_drive_forward]
+    LF[nav: lane_follower]
     CO[nav: contour_avoidance]
   end
 
@@ -74,6 +75,7 @@ flowchart TB
   L --> CAL
   L --> AF
   L --> CO
+  C --> LF
   C --> HOG
   C --> YOLO
   M --> ASR
@@ -89,7 +91,7 @@ flowchart TB
   style BRAIN fill:#fff8f0
 ```
 
-Важно: **`robot_fsm`** и ноды **`autonomous_drive_*`** оба могут слать **`/cmd_vel`**. На роботе должен работать **один** основной контур движения (см. раздел про объезд ниже).
+Важно: **`robot_fsm`**, **`lane_follower`** и **`autonomous_drive_forward`** могут слать **`/cmd_vel`**. На роботе должен работать **один** основной контур движения (см. раздел про объезд и разметку ниже).
 
 ---
 
@@ -154,7 +156,7 @@ stateDiagram-v2
 |------|----------------|---------------|
 | Архитектор FSM | `hackathon_robot/fsm_architect/` | `robot_fsm_node.py` |
 | CV | `hackathon_robot/cv_engineer/` | `person_detector_node.py`, `yolo_finetune_node.py` |
-| Nav | `hackathon_robot/nav_engineer/` | `autonomous_drive_forward.py`, `contour_avoidance.py` |
+| Nav | `hackathon_robot/nav_engineer/` | `lane_follower_node.py`, `autonomous_drive_forward.py`, `contour_avoidance.py` |
 | Платформа / сенсоры | `hackathon_robot/sensing/` | `lidar_calibrator.py` |
 | Голос | `hackathon_robot/voice/` | `asr_vosk_node.py`, `tts_espeak_node.py`, `command_processor_node.py`, `command_parser.py` |
 | Интегратор | `hackathon_robot/launch/`, `config/` | `voice_stack.launch.py`, `bringup_voice_fsm.launch.py` |
@@ -211,7 +213,8 @@ cd ros2_ws/src/hackathon_robot && pip install ".[voice]"
 | Команда | Назначение |
 |---------|------------|
 | `ros2 run hackathon_robot lidar_calibrator` | Калибровка лидара, TF, `/obstacle_detected`, `/front_distance` |
-| `ros2 run hackathon_robot autonomous_drive_forward` | Вперёд + объезд по `/scan` |
+| `ros2 run hackathon_robot lane_follower` | Движение по линии разметки (камера → `/cmd_vel`) |
+| `ros2 run hackathon_robot autonomous_drive_forward` | Вперёд по `/scan`: объезд по «щели», выравнивание курса по `/odom`, откат при застревании |
 | `ros2 run hackathon_robot contour_avoidance` | Объезд контура (альтернативная логика) |
 | `ros2 run hackathon_robot yolo_finetune_node` | Сохранение кадров для дообучения YOLO |
 | `ros2 run hackathon_robot person_detector` | HOG → `/person_detected`, `/person_offset_x` |
@@ -231,11 +234,13 @@ ros2 launch hackathon_robot bringup_voice_fsm.launch.py vosk_model_path:=/ABS/PA
 
 ---
 
-## 8. Лидар · Объезд · YOLO
+## 8. Лидар · Разметка · Объезд · YOLO
 
 **Лидар.** Запускать из каталога, где хотите видеть `params/lidar_calibration.yaml` (файл создаётся относительно текущей рабочей директории процесса). Интерактивный Enter для старта калибровки.
 
-**Объезд.** Калибровка обязательна для нод «вперёд». Имена ROS-нод в коде объезда совпадают (`autonomous_drive`) — **не запускайте обе ноды объезда одновременно**. Не смешивайте **`robot_fsm`** с этими нодами, если все пишут в один **`/cmd_vel`**.
+**Разметка (`lane_follower`).** В нижней части кадра (ROI) строится HSV-маска белой и/или жёлтой линии; по центру масс маски считается боковое смещение и ПИД выдаёт `angular.z`. Параметры: `image_topic`, `linear_speed`, `kp` / `kd`, `roi_top_ratio`, границы `hsv_white_*`, опционально `use_yellow_mask` и `hsv_yellow_*`. При потере линии нода медленно ищет поворотом на месте. Нужны камера и `cv_bridge`; для полосы с другой яркостью подберите HSV вручную (`ros2 param` / launch).
+
+**Объезд (`autonomous_drive_forward`).** Требуется калибровка лидара, как раньше. Логика обновлена: при препятствии робот подруливает к направлению с максимальной оценкой «щели» по `/scan` (вес по косинусу, чтобы предпочитать вперёд), при тупике впереди — разворот на месте к лучшему углу; после освобождения фронта выравнивает курс по одометрии к yaw, зафиксированному в момент обнаружения препятствия; при критически малой дистанции или отсутствии прогресса по `/odom` выполняется короткий откат и снова поиск щели. Имя ROS-ноды в пакете по-прежнему `autonomous_drive`; для `contour_avoidance` имя то же — **не запускайте две ноды объезда сразу**. **`lane_follower`** и **`autonomous_drive_forward`** оба публикуют **`/cmd_vel`** — на роботе должен работать **один** основной источник скорости (или настройте mux/remap).
 
 **YOLO.** Нода только пишет JPEG и предлагает сервис захвата; разметка и `yolo train` — офлайн. Пример `data.yaml`: `hackathon_robot/config/yolo_data.example.yaml`.
 
@@ -264,6 +269,9 @@ development_on_ros2/
       fsm_architect/
       cv_engineer/
       nav_engineer/
+        lane_follower_node.py
+        autonomous_drive_forward.py
+        contour_avoidance.py
       sensing/
 ```
 
@@ -275,7 +283,7 @@ development_on_ros2/
 - [ ] Проверены топики: `ros2 topic list`, камера и лидара на ожидаемых именах.
 - [ ] Nav2 и карта запускаются интегратором; action `navigate_to_pose` виден.
 - [ ] Лидар откалиброван, `params/lidar_calibration.yaml` на месте для выбранного сценария.
-- [ ] Выбран **один** режим движения: **либо** FSM+Nav2, **либо** низкоуровневый объезд.
+- [ ] Выбран **один** режим движения: **либо** FSM+Nav2, **либо** низкоуровневый объезд, **либо** только разметка (`lane_follower`) — без конкурирующих издателей `/cmd_vel`.
 - [ ] Голос: модель Vosk на диске, espeak-ng ставит звук; есть запасной тест через `/voice_cmd`.
 - [ ] Для vision: при необходимости датасет и веса YOLO собраны заранее.
 

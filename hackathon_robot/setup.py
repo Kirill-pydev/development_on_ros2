@@ -28,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'autonomous_drive_forward = hackathon_robot.nav_engineer.autonomous_drive_forward:main',
+            'lane_follower = hackathon_robot.nav_engineer.lane_follower_node:main',
             'contour_avoidance = hackathon_robot.nav_engineer.contour_avoidance:main',
             'lidar_calibrator = hackathon_robot.sensing.lidar_calibrator:main',
             'yolo_finetune_node = hackathon_robot.cv_engineer.yolo_finetune_node:main',
