@@ -19,7 +19,7 @@ setup(
     zip_safe=True,
     maintainer='Hackathon',
     maintainer_email='user@todo',
-    description='Калибровка лидара, объезд препятствий, YOLO, голос, FSM.',
+    description='Калибровка лидара, объезд, разметка, YOLO, голос, FSM, GOD-тестовые ноды.',
     license='Apache-2.0',
     tests_require=['pytest'],
     extras_require={
@@ -37,6 +37,9 @@ setup(
             'tts_espeak = hackathon_robot.voice.tts_espeak_node:main',
             'asr_vosk = hackathon_robot.voice.asr_vosk_node:main',
             'voice_command_processor = hackathon_robot.voice.command_processor_node:main',
+            'god_voice_all = hackathon_robot.god.god_voice_all_node:main',
+            'god_lane_avoid = hackathon_robot.god.god_lane_avoid_node:main',
+            'god_person_stop = hackathon_robot.god.god_person_stop_node:main',
         ],
     },
 )
